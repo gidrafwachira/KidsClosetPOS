@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Shop Stock &amp; Sales</title>
+<meta name="robots" content="noindex">
+<meta name="theme-color" content="#1E6FD9">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@700;800&family=Nunito:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header id="top">
+  <img src="icons/logo.jpg" alt="" width="40" height="40">
+  <div class="shop"><b id="shop-name">Shop</b><span id="role-line"></span></div>
+  <span id="top-actions"></span>
+</header>
+
+<main>
+  <div id="banner"></div>
+  <section id="scanbox" hidden>
+    <video id="cam" playsinline muted></video>
+    <div class="aim"></div>
+    <div id="scan-msg">Hold the tag's square code inside the frame</div>
+    <div class="scan-btns">
+      <button class="btn small" id="torch-btn" data-act="torch" hidden>Light</button>
+      <button class="btn small" data-act="scan-stop">Close camera</button>
+    </div>
+  </section>
+  <div id="view"><p class="muted center">Loading…</p></div>
+</main>
+
+<nav id="tabs"></nav>
+<dialog id="dlg"></dialog>
+<div id="toast" role="status" aria-live="polite"></div>
+<div id="print-area"></div>
+
+<script src="vendor/qrcode.js"></script>
+<script src="vendor/jsQR.js"></script>
+<script src="js/core.js"></script>
+<script src="js/scanner.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
