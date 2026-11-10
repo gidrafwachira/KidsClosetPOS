@@ -30,8 +30,9 @@ ok('tagging creates one numbered item per piece with date and buying price', () 
 ok('selling records price, date, seller, payment and blocks double sales', () => {
   const s = C.newState();
   const [a, b, c] = C.addItems(s, { cat: 'Jeans', buy: 300, tag: 700, qty: 3 }, 'Owner', T0);
-  const r = C.sell(s, [{ code: a, price: '700' }, { code: b, price: '650' }], { pay: 'M-Pesa', by: 'Mary' }, T0 + DAY);
-  assert.deepStrictEqual(r, { saleId: 1, total: 1350, count: 2 });
+  const r = C.sell(s, [{ code: a, price: '700' }, { code: b, price: '650' }], { pay: 'M-Pesa', by: 'Mary', uid: 'u1', saleId: 'A1' }, T0 + DAY);
+  assert.deepStrictEqual(r, { saleId: 'A1', total: 1350, count: 2 });
+  assert.strictEqual(s.items[a].soldByUid, 'u1');
   assert.strictEqual(s.items[a].status, 'sold'); assert.strictEqual(s.items[a].soldAt, T0 + DAY);
   assert.strictEqual(s.items[b].soldPrice, 650); assert.strictEqual(s.items[b].soldBy, 'Mary'); assert.strictEqual(s.items[b].pay, 'M-Pesa');
   throws(() => C.sell(s, [{ code: a, price: 700 }], {}, T0 + DAY), /not in stock/);
@@ -39,7 +40,6 @@ ok('selling records price, date, seller, payment and blocks double sales', () =>
   throws(() => C.sell(s, [{ code: c, price: 5 }, { code: c, price: 5 }], {}, T0 + DAY), /twice/);
   throws(() => C.sell(s, [{ code: '99999', price: 5 }], {}, T0 + DAY), /not in the system/);
   assert.strictEqual(s.items[c].status, 'in', 'a failed sale must change nothing');
-  assert.strictEqual(s.saleSeq, 1);
 });
 
 ok('cancelling a sale returns the item and leaves a trace', () => {
@@ -101,7 +101,7 @@ ok('report adds up sales, profit and flags discounts', () => {
   assert.strictEqual(st.inN, 0); assert.strictEqual(st.soldN, 4);
 });
 
-ok('edit, write-off, delete, CSV and backup check', () => {
+ok('edit, write-off, delete and CSV', () => {
   const s = C.newState();
   const [a, b] = C.addItems(s, { cat: 'Tops', desc: 'red, "frilly"', buy: 200, tag: 500, qty: 2 }, 'Owner', T0);
   assert.strictEqual(C.editItem(s, a, { buy: '250', cat: 'Blouses' }, 'Owner', T0 + 1), 2);
@@ -112,8 +112,6 @@ ok('edit, write-off, delete, CSV and backup check', () => {
   assert.strictEqual(csv.length, 3); assert.ok(csv[1].includes('"red, ""frilly"""'));
   C.deleteItem(s, a, 'mistake', 'Owner', T0 + 4);
   assert.strictEqual(s.items[a], undefined); assert.ok(s.log.some(l => l.type === 'deleted'));
-  assert.ok(C.checkBackup(JSON.parse(JSON.stringify(s))));
-  throws(() => C.checkBackup({ hello: 1 }), /not a backup/);
 });
 
 console.log('\n' + n + ' groups passed');

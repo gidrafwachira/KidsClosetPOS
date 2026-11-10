@@ -1,0 +1,54 @@
+rules_version = '2';
+
+// Who may read and change the shop's records.
+// Paste this whole file into Firebase console > Firestore Database > Rules, then press Publish.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function shop() {
+      return get(/databases/$(database)/documents/shop/main).data;
+    }
+    function isOwner() {
+      return request.auth != null && shop().ownerUid == request.auth.uid;
+    }
+    function isStaff() {
+      return request.auth != null && request.auth.uid in shop().staff;
+    }
+
+    // The shop record: name, owner, sales people, categories, next tag number.
+    match /shop/main {
+      // Before a shop exists anyone signed in may look (and finds nothing); afterwards only its people.
+      allow get: if request.auth != null
+        && (resource == null || resource.data.ownerUid == request.auth.uid || request.auth.uid in resource.data.staff);
+      // The first account to create the shop becomes its owner. It cannot be created twice.
+      allow create: if request.auth != null && request.resource.data.ownerUid == request.auth.uid;
+      // Only the owner changes it, and ownership cannot be handed over from the app.
+      allow update: if request.auth != null && resource.data.ownerUid == request.auth.uid
+        && request.resource.data.ownerUid == resource.data.ownerUid;
+    }
+
+    // One record per tagged piece.
+    match /items/{code} {
+      allow read: if isOwner() || isStaff();
+      allow create, delete: if isOwner();
+      // A sales person may do exactly one thing to an item: sell it while it is in stock, under their own name.
+      allow update: if isOwner() || (isStaff()
+        && resource.data.status == 'in'
+        && request.resource.data.status == 'sold'
+        && request.resource.data.soldByUid == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['status', 'soldAt', 'soldPrice', 'soldBy', 'soldByUid', 'pay', 'saleId']));
+    }
+
+    // Activity log: entries can be added but never changed or removed.
+    match /log/{id} {
+      allow read: if isOwner();
+      allow create: if isOwner()
+        || (isStaff() && request.resource.data.uid == request.auth.uid && request.resource.data.type == 'sold');
+    }
+
+    // Stock counts belong to the owner.
+    match /counts/{id} { allow read, write: if isOwner(); }
+    match /state/{id} { allow read, write: if isOwner(); }
+  }
+}

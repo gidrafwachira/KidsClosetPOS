@@ -1,19 +1,28 @@
-/* Shop inventory + POS: screens and actions. Data rules live in core.js. */
+/* Shop inventory + POS: screens, actions and online sync. Data rules live in core.js. */
 (function () {
   'use strict';
 
   var C = window.Core, Scanner = window.Scanner;
-  var S = null;                 // all shop data
-  var role = 'sales';           // 'sales' or 'owner'
+  var S = C.newState();         // what this phone currently knows; filled from the online records
+  var fb = null, auth = null, db = null, cfg = null, cfgFromFile = false;
+  var me = null;                // signed-in account
+  var shop = null;              // the shop/main record
+  var role = '';                // 'owner' or 'sales'
+  var screen = 'loading';       // loading | connect | signin | noshop | denied | app
   var route = 'sell', routeArg = null;
-  var hiddenAt = 0;
+  var listeners = [], dataStarted = false, dayStart = 0;
+  var shadow = {};              // code -> last saved copy of the item, to work out what changed
+  var sync = { online: navigator.onLine, pending: false, failed: 0 };
+  var renderQueued = false, renderDeferred = false;
   var ui = {
-    basket: [], pay: 'Cash', seller: '',
+    basket: [], pay: 'Cash', signMode: 'in',
     stock: { q: '', status: 'in', cat: '', limit: 60 },
-    rep: { range: 'today', from: '', to: '' },
+    rep: { range: 'today', from: '', to: '', loaded: '', loading: false },
     lastTagged: [], tagForm: { gender: 'Boys', qty: '1' },
-    labelCodes: null, countView: 'scan', showRemaining: false
+    labelCodes: null, countView: 'scan', showRemaining: false,
+    voids: [], hist: { code: '', list: null }, recentLog: null, busy: false
   };
+  var OPEN = ['in', 'missing', 'writeoff'];
 
   var $ = function (sel, el) { return (el || document).querySelector(sel); };
   function esc(v) {
@@ -29,8 +38,16 @@
   function fmtTime(t) { var d = new Date(t); return p2(d.getHours()) + ':' + p2(d.getMinutes()); }
   function fmtDateTime(t) { return fmtDate(t) + ', ' + fmtTime(t); }
   function startOfDay(t) { var d = new Date(t); d.setHours(0, 0, 0, 0); return d.getTime(); }
-  function who() { return role === 'owner' ? 'Owner' : (ui.seller || S.staff[0] || 'Sales person'); }
-  function daysAgo(t) { return Math.floor((Date.now() - t) / C.DAY); }
+  function who() {
+    if (role === 'owner') return 'Owner';
+    var s = shop && shop.staff && me && shop.staff[me.uid];
+    return (s && s.name) || 'Sales person';
+  }
+  function saleNumber(t) {
+    var d = new Date(t);
+    return p2(d.getFullYear() % 100) + p2(d.getMonth() + 1) + p2(d.getDate()) + '-' + p2(d.getHours()) + p2(d.getMinutes()) + p2(d.getSeconds());
+  }
+  function clone(o) { return JSON.parse(JSON.stringify(o)); }
 
   var ICON = {
     sell: '<svg viewBox="0 0 24 24"><path d="M4 7V5a1 1 0 0 1 1-1h2M17 4h2a1 1 0 0 1 1 1v2M20 17v2a1 1 0 0 1-1 1h-2M7 20H5a1 1 0 0 1-1-1v-2M8 8v8M11 8v8M14 8v8M17 8v8"/></svg>',
@@ -40,54 +57,8 @@
     reports: '<svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M21 20H3"/></svg>',
     today: '<svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg>',
     gear: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/></svg>',
-    lock: '<svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>',
     cam: '<svg viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v11H4V8z"/><circle cx="12" cy="13" r="3.5"/></svg>'
   };
-
-  /* ---------- storage: kept on this phone ---------- */
-  var Store = {
-    db: null,
-    open: function () {
-      return new Promise(function (res) {
-        try {
-          var r = indexedDB.open('shop-pos', 1);
-          r.onupgradeneeded = function () { r.result.createObjectStore('kv'); };
-          r.onsuccess = function () { Store.db = r.result; res(); };
-          r.onerror = function () { res(); };
-        } catch (e) { res(); }
-      });
-    },
-    load: function () {
-      if (!Store.db) { try { return Promise.resolve(JSON.parse(localStorage.getItem('shop-pos-state'))); } catch (e) { return Promise.resolve(null); } }
-      return new Promise(function (res) {
-        var q = Store.db.transaction('kv').objectStore('kv').get('state');
-        q.onsuccess = function () { res(q.result || null); };
-        q.onerror = function () { res(null); };
-      });
-    },
-    save: function (state) {
-      if (!Store.db) { localStorage.setItem('shop-pos-state', JSON.stringify(state)); return Promise.resolve(); }
-      return new Promise(function (res, rej) {
-        var tx = Store.db.transaction('kv', 'readwrite');
-        tx.objectStore('kv').put(state, 'state');
-        tx.oncomplete = function () { res(); };
-        tx.onerror = tx.onabort = function () { rej(tx.error); };
-      });
-    }
-  };
-  function save() {
-    return Store.save(S).catch(function (e) { toast('Could not save on this phone: ' + (e && e.message || e), 'bad'); });
-  }
-
-  async function hash(text) {
-    var input = 'shop-pos:' + text;
-    if (window.crypto && crypto.subtle) {
-      var buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
-      return Array.prototype.map.call(new Uint8Array(buf), function (b) { return p2(b.toString(16)); }).join('');
-    }
-    var h = 5381; for (var i = 0; i < input.length; i++) h = ((h << 5) + h + input.charCodeAt(i)) | 0;
-    return 'x' + (h >>> 0).toString(16);
-  }
 
   /* ---------- small UI helpers ---------- */
   var toastTimer = null;
@@ -95,7 +66,19 @@
     var t = $('#toast');
     t.textContent = text; t.className = 'show ' + (kind || '');
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(function () { t.className = ''; }, kind === 'bad' ? 5000 : 2600);
+    toastTimer = setTimeout(function () { t.className = ''; }, kind === 'bad' ? 6000 : 2600);
+  }
+  function friendly(e) {
+    var code = (e && e.code) || '', m = {
+      'auth/invalid-credential': 'Wrong email or password.', 'auth/wrong-password': 'Wrong email or password.',
+      'auth/user-not-found': 'Wrong email or password.', 'auth/invalid-email': 'That email address is not valid.',
+      'auth/email-already-in-use': 'That email already has an account. Sign in instead.',
+      'auth/weak-password': 'The password must be at least 6 characters.',
+      'auth/network-request-failed': 'No internet connection.', 'auth/too-many-requests': 'Too many tries. Wait a few minutes.',
+      'auth/operation-not-allowed': 'Email sign-in is not switched on in Firebase yet (Authentication > Sign-in method).',
+      'permission-denied': 'This account is not allowed to do that.', 'unavailable': 'No internet connection.'
+    };
+    return m[code] || m[code.replace('firestore/', '')] || (e && e.message) || String(e);
   }
 
   function ask(o) {
@@ -110,7 +93,7 @@
         '<div class="row end">' + (o.noCancel ? '' : '<button type="button" class="btn" data-dlg="cancel">' + esc(o.cancelText || 'Cancel') + '</button>') +
         '<button class="btn ' + (o.danger ? 'danger' : 'primary') + '">' + esc(o.okText || 'OK') + '</button></div></form>';
       var form = $('form', d), settled = false;
-      var done = function (v) { if (settled) return; settled = true; if (d.open) d.close(); res(v); };
+      var done = function (v) { if (settled) return; settled = true; if (d.open) d.close(); res(v); if (renderDeferred) render(); };
       form.onsubmit = function (e) {
         e.preventDefault();
         var out = {}; new FormData(form).forEach(function (v, k) { out[k] = String(v).trim(); });
@@ -119,7 +102,6 @@
       var cancel = $('[data-dlg=cancel]', d);
       if (cancel) cancel.onclick = function () { done(null); };
       d.oncancel = function (e) { if (o.noCancel) e.preventDefault(); else done(null); };
-      if (o.onOpen) o.onOpen(d, done);
       d.showModal();
     });
   }
@@ -153,7 +135,148 @@
     setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
   }
 
-  /* ---------- navigation ---------- */
+  /* ---------- online records (Firebase) ---------- */
+  function parseConfig(text) {
+    var out = {}, re = /["']?(\w+)["']?\s*:\s*["']([^"']+)["']/g, m;
+    while ((m = re.exec(text))) out[m[1]] = m[2];
+    return out.apiKey && out.projectId && out.appId ? out : null;
+  }
+  function FV() { return window.firebase.firestore.FieldValue; }
+  function path(a, b) { return new window.firebase.firestore.FieldPath(a, b); }
+  function shopRef() { return db.collection('shop').doc('main'); }
+  function countRef() { return db.collection('state').doc('count'); }
+
+  // Send a list of changes. Not awaited on purpose: without internet they wait on the phone and upload later.
+  function commitOps(ops) {
+    for (var i = 0; i < ops.length; i += 400) {
+      var batch = db.batch();
+      ops.slice(i, i + 400).forEach(function (o) {
+        if (o[0] === 'set') batch.set(o[1], o[2]);
+        else if (o[0] === 'update') batch.update(o[1], o[2]);
+        else batch.delete(o[1]);
+      });
+      batch.commit().catch(function (e) {
+        sync.failed += 1;
+        console.error(e);
+        toast('A change was NOT saved online: ' + friendly(e) + ' Check the item and try again.', 'bad');
+        scheduleRender();
+      });
+    }
+  }
+
+  // Run a change from core.js on what this phone knows, then send exactly what changed.
+  function mutate(fn, extraOps) {
+    var n = S.log.length, out = fn();
+    var logs = S.log.splice(n), touched = {}, ops = [];
+    logs.forEach(function (l) { if (l.code) touched[l.code] = 1; });
+    Object.keys(touched).forEach(function (code) {
+      var after = S.items[code], before = shadow[code] ? JSON.parse(shadow[code]) : null, ref = db.collection('items').doc(code);
+      if (!after) { ops.push(['delete', ref]); delete shadow[code]; return; }
+      after = clone(after);
+      if (!before) ops.push(['set', ref, after]);
+      else {
+        var patch = {}, any = false;
+        Object.keys(after).concat(Object.keys(before)).forEach(function (k) {
+          if (JSON.stringify(after[k]) === JSON.stringify(before[k])) return;
+          patch[k] = after[k] === undefined ? FV().delete() : after[k]; any = true;
+        });
+        if (any) ops.push(['update', ref, patch]);
+      }
+      shadow[code] = JSON.stringify(after);
+    });
+    logs.forEach(function (l) { l.uid = me.uid; ops.push(['set', db.collection('log').doc(), l]); });
+    (extraOps || []).forEach(function (o) { ops.push(o); });
+    if (ops.length) commitOps(ops);
+    return out;
+  }
+
+  function putItem(doc) { var d = doc.data(); S.items[doc.id] = d; shadow[doc.id] = JSON.stringify(d); }
+  function applyItems(kind, snap) {
+    snap.docChanges().forEach(function (ch) {
+      var code = ch.doc.id, mine = S.items[code];
+      if (ch.type === 'removed') {
+        // Left this list: either it changed status (the other list brings it back) or it was deleted.
+        if (mine && (kind === 'open' ? mine.status !== 'sold' : mine.status === 'sold')) { delete S.items[code]; delete shadow[code]; }
+      } else putItem(ch.doc);
+    });
+    sync['pending-' + kind] = snap.metadata.hasPendingWrites;
+    sync.pending = !!(sync['pending-open'] || sync['pending-today']);
+    scheduleRender();
+  }
+  function listenErr(what) {
+    return function (e) { console.error(what, e); toast('Could not load ' + what + ': ' + friendly(e), 'bad'); };
+  }
+  function stopListeners() { listeners.forEach(function (u) { try { u(); } catch (e) { /* ignore */ } }); listeners = []; dataStarted = false; }
+
+  function listenToday() {
+    dayStart = startOfDay(Date.now());
+    return db.collection('items').where('soldAt', '>=', dayStart)
+      .onSnapshot({ includeMetadataChanges: true }, function (s) { applyItems('today', s); }, listenErr("today's sales"));
+  }
+  function startData() {
+    if (dataStarted) return;
+    dataStarted = true;
+    listeners.push(db.collection('items').where('status', 'in', OPEN)
+      .onSnapshot({ includeMetadataChanges: true }, function (s) { applyItems('open', s); }, listenErr('the stock list')));
+    var today = listenToday();
+    listeners.push(function () { today(); });
+    listeners.restartToday = function () { today(); today = listenToday(); };
+    if (role !== 'owner') return;
+    listeners.push(db.collection('log').where('type', '==', 'void').onSnapshot(function (s) {
+      ui.voids = s.docs.map(function (d) { return d.data(); }).sort(function (a, b) { return a.t - b.t; }); scheduleRender();
+    }, listenErr('cancelled sales')));
+    listeners.push(countRef().onSnapshot(function (d) {
+      S.count = d.exists ? d.data() : null;
+      if (S.count) { S.count.scanned = S.count.scanned || {}; S.count.unknown = S.count.unknown || []; }
+      scheduleRender();
+    }, listenErr('the stock count')));
+    listeners.push(db.collection('counts').orderBy('finishedAt', 'desc').limit(10).onSnapshot(function (s) {
+      S.counts = s.docs.map(function (d) { return d.data(); }).reverse(); scheduleRender();
+    }, listenErr('past counts')));
+  }
+
+  function onShop(doc) {
+    if (!doc.exists) { shop = null; screen = 'noshop'; render(); return; }
+    shop = doc.data();
+    S.shop = { name: shop.name || 'Shop', currency: shop.currency || 'KES' };
+    S.categories = shop.categories || S.categories; S.sizes = shop.sizes || S.sizes;
+    S.label = shop.label || S.label; S.seq = shop.seq || 1000;
+    var newRole = shop.ownerUid === me.uid ? 'owner' : (shop.staff && shop.staff[me.uid] ? 'sales' : '');
+    if (!newRole) { stopListeners(); screen = 'denied'; render(); return; }
+    if (newRole !== role) { stopData(); role = newRole; }
+    var first = screen !== 'app';
+    screen = 'app';
+    startData();
+    if (first) { route = 'sell'; render(); } else scheduleRender();
+  }
+  var shopUnsub = null;
+  function stopData() {
+    var keep = shopUnsub; stopListeners();
+    S.items = {}; shadow = {}; S.count = null; S.counts = []; ui.voids = []; shopUnsub = keep;
+  }
+  function onAuth(user) {
+    if (shopUnsub) { shopUnsub(); shopUnsub = null; }
+    stopData();
+    me = user; role = ''; shop = null; ui.basket = [];
+    if (!user) { screen = 'signin'; render(); return; }
+    screen = 'loading'; render();
+    shopUnsub = shopRef().onSnapshot(onShop, function (e) {
+      var code = (e && e.code) || '';
+      if (code.indexOf('permission-denied') >= 0) { stopListeners(); screen = 'denied'; render(); }
+      else toast('Could not reach the shop records: ' + friendly(e), 'bad');
+    });
+  }
+
+  async function ensureItem(code) {
+    if (S.items[code] || !C.validCode(code)) return;
+    try { var d = await db.collection('items').doc(code).get(); if (d.exists) putItem(d); } catch (e) { /* offline and never seen: treated as unknown */ }
+  }
+  async function fetchItems(query) {
+    var snap = await query.get();
+    snap.docs.forEach(function (d) { if (!S.items[d.id] || !d.metadata.hasPendingWrites) putItem(d); });
+  }
+
+  /* ---------- navigation and drawing ---------- */
   var OWNER_TABS = [['sell', 'Sell'], ['tag', 'Tag'], ['stock', 'Stock'], ['count', 'Count'], ['reports', 'Reports']];
   var SALES_TABS = [['sell', 'Sell'], ['today', 'Today']];
 
@@ -161,19 +284,48 @@
     if (role !== 'owner' && to !== 'sell' && to !== 'today') to = 'sell';
     if (to !== route || (to !== 'sell' && to !== 'count')) stopScan();
     route = to; routeArg = arg == null ? null : arg;
+    if (to === 'reports') loadReport();
+    if (to === 'item') loadHistory(arg);
+    if (to === 'log') loadRecentLog();
     render();
     window.scrollTo(0, 0);
   }
 
+  // Updates arriving from the other phone redraw the screen, but never while someone is typing.
+  function scheduleRender() {
+    if (renderQueued) return;
+    renderQueued = true;
+    setTimeout(function () { renderQueued = false; softRender(); }, 60);
+  }
+  function softRender() {
+    var a = document.activeElement, typing = a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && $('#view').contains(a);
+    if (typing || $('#dlg').open) { renderDeferred = true; renderHeader(); return; }
+    render();
+  }
+
+  function renderHeader() {
+    $('#shop-name').textContent = screen === 'app' ? S.shop.name : 'Shop Stock & Sales';
+    var line = '', cls = '';
+    if (screen === 'app') {
+      line = (role === 'owner' ? 'Owner' : who()) + ' · ';
+      if (!sync.online) { line += 'No internet: saving on this phone'; cls = 'warn'; }
+      else if (sync.pending) { line += 'Uploading…'; cls = 'warn'; }
+      else line += 'Saved online';
+    }
+    var rl = $('#role-line'); rl.textContent = line; rl.className = cls;
+    document.body.className = screen === 'app' ? role : '';
+    $('#top-actions').innerHTML = screen === 'app' && role === 'owner'
+      ? '<button class="icon-btn" data-act="go" data-to="settings" aria-label="Settings">' + ICON.gear + '</button>' : '';
+  }
+
   function render() {
-    if (!S.pinHash) { $('#top-actions').innerHTML = ''; $('#tabs').innerHTML = ''; $('#role-line').textContent = 'First-time setup'; $('#view').innerHTML = viewSetup(); return; }
-    $('#shop-name').textContent = S.shop.name;
-    $('#role-line').textContent = role === 'owner' ? 'Owner mode' : 'Sales mode';
-    document.body.className = role;
-    $('#top-actions').innerHTML = role === 'owner'
-      ? '<button class="icon-btn" data-act="go" data-to="settings" aria-label="Settings">' + ICON.gear + '</button>' +
-        '<button class="btn small" data-act="lock">' + ICON.lock + ' Lock</button>'
-      : '<button class="btn small" data-act="unlock">' + ICON.lock + ' Owner</button>';
+    renderDeferred = false;
+    renderHeader();
+    if (screen !== 'app') {
+      $('#tabs').innerHTML = ''; $('#banner').innerHTML = '';
+      $('#view').innerHTML = ({ loading: viewLoading, connect: viewConnect, signin: viewSignin, noshop: viewNoShop, denied: viewDenied }[screen] || viewLoading)();
+      return;
+    }
     var tabs = role === 'owner' ? OWNER_TABS : SALES_TABS;
     var base = route === 'item' ? 'stock' : route === 'labels' ? 'tag' : route;
     $('#tabs').innerHTML = tabs.map(function (t) {
@@ -182,58 +334,41 @@
     var views = { sell: viewSell, today: viewToday, tag: viewTag, labels: viewLabels, stock: viewStock, item: viewItem,
       count: viewCount, reports: viewReports, settings: viewSettings, log: viewLog };
     $('#view').innerHTML = (views[route] || viewSell)();
-    renderBanner();
+    $('#banner').innerHTML = sync.failed ? '<div class="banner bad"><span>' + sync.failed + ' change' + (sync.failed === 1 ? ' was' : 's were') +
+      ' rejected and not saved online. What you see now is the true record.</span><button class="btn small" data-act="clear-failed">OK</button></div>' : '';
   }
 
-  function renderBanner() {
-    var html = '';
-    var n = Object.keys(S.items).length;
-    if (role === 'owner' && n > 0 && Date.now() - (S.lastBackup || 0) > 7 * C.DAY) {
-      html = '<div class="banner"><span>' + (S.lastBackup ? 'Last backup was ' + daysAgo(S.lastBackup) + ' days ago.' : 'No backup yet.') +
-        ' All records live on this phone only.</span><button class="btn small" data-act="backup">Back up now</button></div>';
-    }
-    $('#banner').innerHTML = html;
+  /* ---------- connect, sign in, create shop ---------- */
+  function viewLoading() { return '<p class="muted center pad">Loading…</p>'; }
+  function viewConnect() {
+    return '<form class="card" data-form="connect"><h2>Connect this phone</h2>' +
+      '<p class="muted">Paste the Firebase settings for your shop here (the block that starts with <b>const firebaseConfig</b>). See the README for where to find it. Every phone uses the same block.</p>' +
+      '<label>Firebase settings<textarea name="config" rows="9" required placeholder="const firebaseConfig = {&#10;  apiKey: &quot;...&quot;,&#10;  projectId: &quot;...&quot;,&#10;  ...&#10;};"></textarea></label>' +
+      '<button class="btn primary big">Connect</button></form>';
   }
-
-  /* ---------- setup and owner PIN ---------- */
-  function viewSetup() {
-    return '<form class="card" data-form="setup"><h2>Set up your shop</h2>' +
-      '<p class="muted">Choose an owner PIN. Without it, the phone can only scan and sell. With it, you can tag stock, see buying prices and profit, run stock counts and change settings.</p>' +
-      '<label>Shop name<input name="name" value="' + esc(S.shop.name) + '" required></label>' +
-      '<label>Owner PIN (4 to 8 digits)<input name="pin" type="password" inputmode="numeric" pattern="[0-9]{4,8}" required autocomplete="off"></label>' +
-      '<label>Repeat the PIN<input name="pin2" type="password" inputmode="numeric" pattern="[0-9]{4,8}" required autocomplete="off"></label>' +
-      '<button class="btn primary big">Start</button>' +
-      '<p class="muted small">Moving from another phone? <button type="button" class="link" data-act="restore-pick">Restore from a backup file</button></p></form>';
+  function viewSignin() {
+    var create = ui.signMode === 'create';
+    return '<form class="card" data-form="signin"><h2>' + (create ? 'Create the owner account' : 'Sign in') + '</h2>' +
+      (create ? '<p class="muted">Do this once, on the owner\'s phone. Sales people get their logins from the owner afterwards.</p>' : '') +
+      '<label>Email<input name="email" type="email" required autocomplete="username"></label>' +
+      '<label>Password<input name="pw" type="password" required minlength="6" autocomplete="' + (create ? 'new-password' : 'current-password') + '"></label>' +
+      (create ? '<label>Repeat the password<input name="pw2" type="password" required minlength="6" autocomplete="new-password"></label>' : '') +
+      '<button class="btn primary big">' + (create ? 'Create account' : 'Sign in') + '</button>' +
+      '<p class="muted small center"><button type="button" class="link" data-act="sign-mode">' +
+      (create ? 'I already have a login' : 'Owner, first time? Create the owner account') + '</button></p>' +
+      (cfgFromFile ? '' : '<p class="muted small center"><button type="button" class="link" data-act="disconnect">Use different Firebase settings</button></p>') + '</form>';
   }
-
-  async function unlock() {
-    var v = await ask({
-      title: 'Owner PIN', okText: 'Unlock',
-      fields: [{ name: 'pin', label: 'Enter the owner PIN', type: 'password', inputmode: 'numeric', required: true }],
-      html: '<p class="muted small"><button type="button" class="link" data-dlg-act="forgot">Forgot the PIN?</button></p>',
-      onOpen: function (d, done) { $('[data-dlg-act=forgot]', d).onclick = function () { done({ forgot: true }); }; }
-    });
-    if (!v) return;
-    if (v.forgot) return forgotPin();
-    if (await hash(v.pin) !== S.pinHash) { toast('Wrong PIN.', 'bad'); return; }
-    setRole('owner');
+  function viewNoShop() {
+    return '<form class="card" data-form="create-shop"><h2>Set up the shop</h2>' +
+      '<p class="muted">No shop has been set up on these records yet. The account you are signed in with (' + esc(me.email) + ') becomes the owner.</p>' +
+      '<label>Shop name<input name="name" value="Kidsclosetbydee" required></label>' +
+      '<button class="btn primary big">Create shop</button>' +
+      '<button type="button" class="btn ghost" data-act="sign-out">Sign out</button></form>';
   }
-  async function forgotPin() {
-    var v = await ask({
-      title: 'Reset the owner PIN', okText: 'Reset PIN',
-      fields: [{ name: 'rec', label: 'Recovery code (given when the shop was set up)', inputmode: 'numeric', required: true },
-        { name: 'pin', label: 'New PIN (4 to 8 digits)', type: 'password', inputmode: 'numeric', required: true }]
-    });
-    if (!v) return;
-    if (await hash('rec:' + v.rec.replace(/\D/g, '')) !== S.recoveryHash) { toast('That recovery code is not correct.', 'bad'); return; }
-    if (!/^\d{4,8}$/.test(v.pin)) { toast('The PIN must be 4 to 8 digits.', 'bad'); return; }
-    S.pinHash = await hash(v.pin); await save();
-    toast('PIN changed.'); setRole('owner');
-  }
-  function setRole(r) {
-    role = r;
-    try { sessionStorage.setItem('shop-pos-role', r); } catch (e) { /* ignore */ }
-    go(r === 'owner' ? route : 'sell');
+  function viewDenied() {
+    return '<div class="card"><h2>Not added to this shop</h2><p class="muted">The account ' + esc(me && me.email) +
+      ' has not been added to the shop. Ask the owner to add you under Settings &gt; Sales people, then sign in again.</p>' +
+      '<button class="btn" data-act="sign-out">Sign out</button></div>';
   }
 
   /* ---------- scanning ---------- */
@@ -265,11 +400,12 @@
   }
 
   /* ---------- SELL ---------- */
-  function addToBasket(raw) {
+  async function addToBasket(raw) {
     var code = C.normCode(raw);
     if (!C.validCode(code)) return feedback('bad', code ? 'Tag number ' + code + ' is not valid. Check the digits.' : 'That is not a shop tag.');
+    await ensureItem(code);
     var it = S.items[code];
-    if (!it) return feedback('bad', 'Tag ' + code + ' is not in the system. Tell the owner.');
+    if (!it) return feedback('bad', 'Tag ' + code + ' is not in the system' + (sync.online ? '' : ' (or cannot be checked without internet)') + '. Tell the owner.');
     if (it.status === 'sold') return feedback('bad', 'Tag ' + code + ' was already sold on ' + fmtDate(it.soldAt) + '. Keep it aside and tell the owner.');
     if (it.status !== 'in') return feedback('bad', 'Tag ' + code + ' is marked ' + C.statusLabel(it.status) + '. Keep it aside and tell the owner.');
     if (ui.basket.some(function (l) { return l.code === code; })) return feedback('warn', 'Tag ' + code + ' is already in this sale.');
@@ -280,12 +416,11 @@
   function basketTotal() { return ui.basket.reduce(function (s, l) { return s + (Number(l.price) || 0); }, 0); }
 
   function viewSell() {
-    var seller = role === 'sales' && S.staff.length > 1
-      ? '<label class="inline">Who is selling?<select data-change="seller">' + S.staff.map(function (n) {
-        return '<option' + (n === who() ? ' selected' : '') + '>' + esc(n) + '</option>';
-      }).join('') + '</select></label>' : '';
-    var html = '<div class="card">' + seller +
-      '<button class="btn primary big" data-act="scan-toggle">' + ICON.cam + (Scanner.running() ? ' Close camera' : ' Scan a tag') + '</button>' +
+    // If the other phone sold or removed something that is in this basket, drop it here.
+    var gone = ui.basket.filter(function (l) { return !S.items[l.code] || S.items[l.code].status !== 'in'; });
+    if (gone.length) ui.basket = ui.basket.filter(function (l) { return gone.indexOf(l) < 0; });
+    var html = (gone.length ? '<div class="banner bad"><span>Removed from this sale, no longer in stock: tag ' + gone.map(function (l) { return l.code; }).join(', ') + '</span></div>' : '') +
+      '<div class="card"><button class="btn primary big" data-act="scan-toggle">' + ICON.cam + (Scanner.running() ? ' Close camera' : ' Scan a tag') + '</button>' +
       '<form class="row" data-form="add-code"><input name="code" inputmode="numeric" placeholder="or type the tag number" autocomplete="off" aria-label="Tag number">' +
       '<button class="btn">Add</button></form></div>';
     if (!ui.basket.length) {
@@ -309,20 +444,22 @@
   }
 
   async function completeSale() {
-    var res;
-    try { res = C.sell(S, ui.basket, { pay: ui.pay, by: who() }, Date.now()); }
-    catch (e) { if (e.user) return toast(e.message, 'bad'); throw e; }
-    await save();
+    var res, now = Date.now();
+    try {
+      res = mutate(function () { return C.sell(S, ui.basket, { pay: ui.pay, by: who(), uid: me.uid, saleId: saleNumber(now) }, now); });
+    } catch (e) { if (e.user) return toast(e.message, 'bad'); throw e; }
+    var pay = ui.pay;
     ui.basket = [];
     Scanner.beep('ok');
     render();
     await ask({
-      title: 'Sale #' + res.saleId + ' recorded', okText: 'Next customer', noCancel: true,
-      html: '<p class="bigsum">' + fmt(res.total) + '</p><p class="muted center">' + res.count + (res.count === 1 ? ' item' : ' items') + ' · ' + esc(ui.pay) + ' · ' + fmtDateTime(Date.now()) + '</p>'
+      title: 'Sale recorded', okText: 'Next customer', noCancel: true,
+      html: '<p class="bigsum">' + fmt(res.total) + '</p><p class="muted center">' + res.count + (res.count === 1 ? ' item' : ' items') + ' · ' + esc(pay) + ' · ' + fmtDateTime(now) +
+        '<br>Sale no. ' + esc(res.saleId) + (sync.online ? '' : '<br><b>No internet now. It will upload when the connection returns.</b>') + '</p>'
     });
   }
 
-  /* ---------- TODAY (sales person's cash-up) ---------- */
+  /* ---------- TODAY ---------- */
   function saleRows(codes, showProfit) {
     if (!codes.length) return '<p class="muted">No sales.</p>';
     return codes.map(function (code) {
@@ -337,7 +474,8 @@
     return '<div class="card"><h2>Today, ' + fmtDate(Date.now()) + '</h2><div class="tiles">' +
       tile('Items sold', r.n) + tile('Total', fmt(r.revenue)) +
       C.PAYMENTS.map(function (p) { return r.byPay[p] ? tile(p, fmt(r.byPay[p].amount)) : ''; }).join('') +
-      '</div></div><div class="card"><h2>Sales</h2>' + saleRows(r.sales, false) + '</div>';
+      '</div></div><div class="card"><h2>Sales</h2>' + saleRows(r.sales, false) + '</div>' +
+      '<div class="card"><p class="muted small">Signed in as ' + esc(who()) + ' (' + esc(me.email) + ')</p><button class="btn" data-act="sign-out">Sign out</button></div>';
   }
   function tile(label, value, cls) { return '<div class="tile ' + (cls || '') + '"><span>' + esc(label) + '</span><b>' + esc(value) + '</b></div>'; }
 
@@ -345,8 +483,8 @@
   function viewTag() {
     var f = ui.tagForm, st = C.stock(S, Date.now()), html = '';
     if (ui.lastTagged.length) {
-      var codes = ui.lastTagged;
-      html += '<div class="card good"><h2>' + codes.length + (codes.length === 1 ? ' item tagged' : ' items tagged') + '</h2>' +
+      var codes = ui.lastTagged.filter(function (c) { return S.items[c]; });
+      if (codes.length) html += '<div class="card good"><h2>' + codes.length + (codes.length === 1 ? ' item tagged' : ' items tagged') + '</h2>' +
         '<p>Tag number' + (codes.length === 1 ? ' <b>' + codes[0] + '</b>' : 's <b>' + codes[0] + '</b> to <b>' + codes[codes.length - 1] + '</b>') +
         ', dated ' + fmtDate(Date.now()) + '. Print the labels, or write the number on each tag by hand for now.</p>' +
         '<div class="lbl-preview" style="--w:70mm;--h:30mm">' + codes.slice(0, 2).map(function (c) { return labelHtml(S.items[c]); }).join('') + '</div>' +
@@ -365,8 +503,8 @@
       '<div class="two"><label>Buying price (' + cur() + ')<input name="buy" inputmode="decimal" value="' + esc(f.buy || '') + '" required autocomplete="off"></label>' +
       '<label>Tag price (' + cur() + ')<input name="tag" inputmode="decimal" value="' + esc(f.tag || '') + '" autocomplete="off"></label></div>' +
       '<label>How many identical pieces?<input name="qty" inputmode="numeric" value="' + esc(f.qty || '1') + '" autocomplete="off"></label>' +
-      '<p class="muted small">Each piece gets its own number. The tag price is what you expect to sell at; a sale below it is flagged in your reports.</p>' +
-      '<button class="btn primary big">Save and create tag' + '</button></form>';
+      '<p class="muted small">Each piece gets its own number. The tag price is what you expect to sell at; a sale below it is flagged in your reports. Tagging needs internet.</p>' +
+      '<button class="btn primary big"' + (ui.busy ? ' disabled' : '') + '>Save and create tag</button></form>';
     if (st.unprinted) {
       html += '<div class="card"><div class="row between"><span><b>' + st.unprinted + '</b> label' + (st.unprinted === 1 ? '' : 's') + ' not printed yet</span>' +
         '<button class="btn" data-act="labels-unprinted">Print labels</button></div></div>';
@@ -412,12 +550,13 @@
     st.textContent = '@page{size:' + (L.roll ? L.w + 'mm ' + L.h + 'mm' : 'A4') + ';margin:0}';
     window.print();
   }
+  function saveLabelPrefs() { shopRef().update({ label: clone(S.label) }).catch(function (e) { toast(friendly(e), 'bad'); }); }
 
   /* ---------- STOCK ---------- */
   function stockMatches() {
     var f = ui.stock, words = f.q.toLowerCase().split(/\s+/).filter(Boolean);
     var list = Object.keys(S.items).map(function (c) { return S.items[c]; }).filter(function (it) {
-      if (f.status && it.status !== f.status) return false;
+      if (!words.length || !C.validCode(C.normCode(f.q))) { if (it.status !== f.status) return false; }
       if (f.cat && it.cat !== f.cat) return false;
       if (!words.length) return true;
       var hay = (it.code + ' ' + it.cat + ' ' + it.gender + ' ' + it.size + ' ' + it.desc).toLowerCase();
@@ -434,16 +573,17 @@
   }
   function stockListHtml() {
     var list = stockMatches(), f = ui.stock;
-    if (!list.length) return '<p class="muted pad center">' + (Object.keys(S.items).length ? 'Nothing matches.' : 'No stock yet. Go to Tag to add your first items.') + '</p>';
-    return '<p class="muted small">' + list.length + ' item' + (list.length === 1 ? '' : 's') + '</p>' + list.slice(0, f.limit).map(itemRow).join('') +
+    var note = f.status === 'sold' ? '<p class="muted small">Showing the most recent sales. Type a tag number to find an older one.</p>' : '';
+    if (!list.length) return note + '<p class="muted pad center">' + (f.q || f.cat || f.status !== 'in' ? 'Nothing matches.' : 'No stock yet. Go to Tag to add your first items.') + '</p>';
+    return note + '<p class="muted small">' + list.length + ' item' + (list.length === 1 ? '' : 's') + '</p>' + list.slice(0, f.limit).map(itemRow).join('') +
       (list.length > f.limit ? '<button class="btn ghost" data-act="stock-more">Show more</button>' : '');
   }
   function viewStock() {
     var st = C.stock(S, Date.now()), f = ui.stock;
     return '<div class="card"><div class="tiles">' + tile('In stock', st.inN) + tile('Stock at cost', fmt(st.inCost)) +
-      tile('Sold', st.soldN) + tile('Missing', st.missingN, st.missingN ? 'bad' : '') + '</div></div>' +
+      tile('Missing', st.missingN, st.missingN ? 'bad' : '') + tile('Written off', st.writeoffN) + '</div></div>' +
       '<div class="card"><input type="search" data-input="stock-q" value="' + esc(f.q) + '" placeholder="Search tag number, category, size…" aria-label="Search stock">' +
-      '<div class="chips">' + [['in', 'In stock'], ['sold', 'Sold'], ['missing', 'Missing'], ['writeoff', 'Written off'], ['', 'All']].map(function (s) {
+      '<div class="chips">' + [['in', 'In stock'], ['sold', 'Sold'], ['missing', 'Missing'], ['writeoff', 'Written off']].map(function (s) {
         return '<button data-act="stock-status" data-status="' + s[0] + '"' + (f.status === s[0] ? ' class="on"' : '') + '>' + s[1] + '</button>';
       }).join('') + '</div>' +
       '<select data-change="stock-cat" aria-label="Category"><option value="">All categories</option>' + S.categories.map(function (c) {
@@ -451,6 +591,14 @@
       }).join('') + '</select><div id="stock-list">' + stockListHtml() + '</div></div>';
   }
 
+  function loadHistory(code) {
+    ui.hist = { code: code, list: null };
+    db.collection('log').where('code', '==', code).get().then(function (s) {
+      if (ui.hist.code !== code) return;
+      ui.hist.list = s.docs.map(function (d) { return d.data(); }).sort(function (a, b) { return b.t - a.t; });
+      scheduleRender();
+    }).catch(function () { if (ui.hist.code === code) { ui.hist.list = []; scheduleRender(); } });
+  }
   function viewItem() {
     var it = S.items[routeArg];
     if (!it) return '<div class="card"><p>This item no longer exists.</p><button class="btn" data-act="go" data-to="stock">Back to stock</button></div>';
@@ -459,7 +607,7 @@
       ['Status', C.statusLabel(it.status)]];
     if (it.status === 'sold') {
       rows.push(['Date sold', fmtDateTime(it.soldAt)], ['Selling price', fmt(it.soldPrice)], ['Profit', fmt(it.soldPrice - it.buy)],
-        ['Payment', it.pay], ['Sold by', it.soldBy], ['Sale number', '#' + it.saleId]);
+        ['Payment', it.pay], ['Sold by', it.soldBy], ['Sale number', it.saleId]);
     } else if (it.status !== 'in') { rows.push(['Since', fmtDateTime(it.outAt)], ['Note', it.note]); }
     var acts = '<button class="btn" data-act="item-edit">Edit details</button><button class="btn" data-act="item-label">Print label</button>';
     if (it.status === 'in') {
@@ -469,34 +617,41 @@
     } else {
       acts += '<button class="btn" data-act="item-return">' + (it.status === 'sold' ? 'Cancel the sale, return to stock' : 'Found, return to stock') + '</button>';
     }
-    var hist = S.log.filter(function (l) { return l.code === it.code; }).reverse();
     return '<button class="btn ghost back" data-act="go" data-to="stock">‹ Stock</button>' +
       '<div class="card"><h2>' + esc(C.describe(it)) + ' <span class="st ' + it.status + '">' + C.statusLabel(it.status) + '</span></h2>' +
       '<div class="lbl-preview" style="--w:70mm;--h:30mm">' + labelHtml(it) + '</div>' +
       '<dl>' + rows.filter(function (r) { return r[1] !== '' && r[1] != null; }).map(function (r) { return '<dt>' + r[0] + '</dt><dd>' + esc(r[1]) + '</dd>'; }).join('') + '</dl>' +
       '<div class="acts">' + acts + '</div></div>' +
-      '<div class="card"><h2>History</h2>' + logRows(hist) + '</div>';
+      '<div class="card"><h2>History</h2>' + (ui.hist.code === it.code && ui.hist.list ? logRows(ui.hist.list) : '<p class="muted">Loading…</p>') + '</div>';
   }
   function logRows(list) {
     if (!list.length) return '<p class="muted">Nothing yet.</p>';
     var names = { tagged: 'Tagged', sold: 'Sold', 'void': 'Sale cancelled', found: 'Returned to stock', missing: 'Marked missing',
       writeoff: 'Written off', edited: 'Edited', deleted: 'Deleted', 'count-start': 'Stock count started',
-      'count-finish': 'Stock count finished', 'count-cancel': 'Stock count cancelled', restore: 'Backup restored' };
+      'count-finish': 'Stock count finished', 'count-cancel': 'Stock count cancelled' };
     return list.map(function (l) {
-      return '<div class="line"><div class="grow"><b>' + (names[l.type] || l.type) + (l.code ? ' · tag ' + l.code : '') + '</b><small>' +
+      return '<div class="line"><div class="grow"><b>' + (names[l.type] || esc(l.type)) + (l.code ? ' · tag ' + esc(l.code) : '') + '</b><small>' +
         fmtDateTime(l.t) + (l.by ? ' · ' + esc(l.by) : '') + (l.info ? ' · ' + esc(l.info) : '') + '</small></div></div>';
     }).join('');
   }
+  function loadRecentLog() {
+    ui.recentLog = null;
+    db.collection('log').orderBy('t', 'desc').limit(300).get().then(function (s) {
+      ui.recentLog = s.docs.map(function (d) { return d.data(); }); scheduleRender();
+    }).catch(function (e) { ui.recentLog = []; toast(friendly(e), 'bad'); scheduleRender(); });
+  }
   function viewLog() {
-    var list = S.log.slice(-300).reverse();
     return '<button class="btn ghost back" data-act="go" data-to="settings">‹ Settings</button><div class="card"><h2>Activity log</h2>' +
-      '<p class="muted small">Every change, newest first (last 300). Nothing here can be edited.</p>' + logRows(list) + '</div>';
+      '<p class="muted small">Every change on every phone, newest first (last 300). Nothing here can be edited.</p>' +
+      (ui.recentLog ? logRows(ui.recentLog) : '<p class="muted">Loading…</p>') + '</div>';
   }
 
   /* ---------- COUNT ---------- */
-  function countScan(raw) {
-    var r;
-    try { r = C.countScan(S, raw, Date.now()); } catch (e) { return toast(e.message, 'bad'); }
+  async function countScan(raw) {
+    var code = C.normCode(raw), r, now = Date.now();
+    await ensureItem(code);
+    if (!S.count) return;
+    try { r = C.countScan(S, raw, now); } catch (e) { return toast(e.message, 'bad'); }
     var d = r.item ? C.describe(r.item) : '';
     if (r.kind === 'ok') feedback('ok', 'Counted: ' + d);
     else if (r.kind === 'dup') feedback('warn', 'Already counted: ' + d);
@@ -504,7 +659,10 @@
     else if (r.kind === 'found') feedback('warn', 'Was marked ' + C.statusLabel(r.item.status) + ', now found: ' + d);
     else if (r.kind === 'scope') feedback('warn', 'Other category (' + r.item.cat + '), not part of this count.');
     else feedback('bad', 'Unknown tag ' + r.code + '. Put it aside.');
-    save();
+    var save = null;
+    if (r.kind === 'unknown') save = countRef().update({ unknown: FV().arrayUnion(r.code) });
+    else if (r.kind === 'ok' || r.kind === 'sold' || r.kind === 'found') save = countRef().update(path('scanned', r.item.code), now);
+    if (save) save.catch(function (e) { toast('Count not saved online: ' + friendly(e), 'bad'); });
     render();
   }
   function codeList(codes, max) {
@@ -565,6 +723,17 @@
     }
     return [t0, t0 + C.DAY, 'Today, ' + fmtDate(now)];
   }
+  // Older sales are not kept on the phone all the time; fetch the chosen period when the report opens.
+  function loadReport() {
+    var rg = repRange(), key = rg[0] + '-' + rg[1];
+    if (rg[0] >= dayStart) { ui.rep.loaded = key; ui.rep.loading = false; return; }   // today is always live
+    ui.rep.loading = true; ui.rep.loaded = '';
+    fetchItems(db.collection('items').where('soldAt', '>=', rg[0]).where('soldAt', '<', rg[1])).then(function () {
+      ui.rep.loaded = key;
+    }).catch(function (e) { toast('Could not load that period: ' + friendly(e), 'bad'); }).then(function () {
+      ui.rep.loading = false; scheduleRender();
+    });
+  }
   function breakdown(map, withProfit) {
     var keys = Object.keys(map).sort(function (a, b) { return map[b].amount - map[a].amount; });
     if (!keys.length) return '<p class="muted">No sales.</p>';
@@ -573,8 +742,9 @@
         (withProfit ? ' · profit ' + fmt(map[k].profit) : '') + '</small></div><b>' + fmt(map[k].amount) + '</b></div>';
     }).join('');
   }
+  function reportData() { var rg = repRange(); return C.report({ items: S.items, log: ui.voids }, rg[0], rg[1]); }
   function viewReports() {
-    var rg = repRange(), r = C.report(S, rg[0], rg[1]), st = C.stock(S, Date.now()), f = ui.rep;
+    var rg = repRange(), r = reportData(), st = C.stock(S, Date.now()), f = ui.rep;
     var margin = r.revenue ? Math.round(100 * r.profit / r.revenue) + '%' : '0%';
     var flags = '';
     if (r.belowTag.length) flags += '<h3>Sold below the tag price <span class="pill bad">' + r.belowTag.length + '</span></h3>' + r.belowTag.map(function (c) {
@@ -588,7 +758,8 @@
       return '<button data-act="rep-range" data-range="' + c[0] + '"' + (f.range === c[0] ? ' class="on"' : '') + '>' + c[1] + '</button>';
     }).join('') + '</div>' +
       (f.range === 'custom' ? '<div class="two"><label>From<input type="date" data-change="rep-from" value="' + esc(f.from) + '"></label><label>To<input type="date" data-change="rep-to" value="' + esc(f.to) + '"></label></div>' : '') +
-      '<h2>' + esc(rg[2]) + '</h2><div class="tiles">' + tile('Items sold', r.n) + tile('Sales', fmt(r.revenue)) + tile('Cost of those items', fmt(r.cost)) +
+      '<h2>' + esc(rg[2]) + '</h2>' + (f.loading ? '<p class="muted">Loading this period…</p>' : '') +
+      '<div class="tiles">' + tile('Items sold', r.n) + tile('Sales', fmt(r.revenue)) + tile('Cost of those items', fmt(r.cost)) +
       tile('Profit (' + margin + ')', fmt(r.profit), r.profit < 0 ? 'bad' : 'ok') + '</div>' +
       '<button class="btn" data-act="share-summary">Send this summary (WhatsApp)</button></div>' +
       '<div class="card"><h2>By payment</h2>' + breakdown(r.byPay) + '</div>' +
@@ -603,7 +774,7 @@
       '<div class="card"><button class="btn" data-act="export-csv">Download everything for Excel (CSV)</button></div>';
   }
   function summaryText() {
-    var rg = repRange(), r = C.report(S, rg[0], rg[1]), st = C.stock(S, Date.now());
+    var rg = repRange(), r = reportData(), st = C.stock(S, Date.now());
     var lines = [S.shop.name + ': ' + rg[2], 'Items sold: ' + r.n, 'Sales: ' + fmt(r.revenue), 'Profit: ' + fmt(r.profit)];
     Object.keys(r.byPay).forEach(function (p) { lines.push(p + ': ' + fmt(r.byPay[p].amount)); });
     if (r.belowTag.length) lines.push('Sold below tag price: ' + r.belowTag.length);
@@ -615,58 +786,36 @@
 
   /* ---------- SETTINGS ---------- */
   function viewSettings() {
+    var staff = shop.staff || {}, ids = Object.keys(staff);
     return '<form class="card" data-form="settings"><h2>Settings</h2>' +
       '<label>Shop name<input name="name" value="' + esc(S.shop.name) + '" required></label>' +
-      '<label>Sales people (one name per line)<textarea name="staff" rows="3">' + esc(S.staff.join('\n')) + '</textarea></label>' +
       '<label>Categories (one per line)<textarea name="categories" rows="8">' + esc(S.categories.join('\n')) + '</textarea></label>' +
       '<label>Sizes (one per line)<textarea name="sizes" rows="6">' + esc(S.sizes.join('\n')) + '</textarea></label>' +
       '<button class="btn primary">Save settings</button></form>' +
-      '<div class="card"><h2>Backup</h2><p class="muted">All records are stored on this phone only. A backup file lets you recover them if the phone is lost, reset or replaced. ' +
-      (S.lastBackup ? 'Last backup: ' + fmtDateTime(S.lastBackup) + '.' : 'No backup made yet.') + '</p>' +
-      '<button class="btn primary" data-act="backup">Save a backup file</button>' +
-      '<button class="btn" data-act="restore-pick">Restore from a backup file</button>' +
-      '<input type="file" id="restore-file" accept="application/json,.json" hidden></div>' +
-      '<div class="card"><h2>Security</h2><button class="btn" data-act="change-pin">Change owner PIN</button>' +
-      '<button class="btn" data-act="go" data-to="log">Activity log</button></div>';
-  }
-  async function backup() {
-    var name = 'shop-backup-' + C.isoDay(Date.now()) + '.json', text = JSON.stringify(S);
-    S.lastBackup = Date.now();
-    try {
-      var file = new File([text], name, { type: 'application/json' });
-      if (navigator.canShare && navigator.canShare({ files: [file] })) {
-        await navigator.share({ files: [file], title: name });
-      } else { download(name, text, 'application/json'); }
-    } catch (e) {
-      if (e && e.name === 'AbortError') return;
-      download(name, text, 'application/json');
-    }
-    await save(); render();
-    toast('Backup saved. Keep the file somewhere off this phone (email, WhatsApp to yourself, Google Drive).');
-  }
-  async function restoreFrom(file) {
-    var obj;
-    try { obj = C.checkBackup(JSON.parse(await file.text())); }
-    catch (e) { return toast(e.user ? e.message : 'That file could not be read.', 'bad'); }
-    var n = Object.keys(obj.items).length, mine = S ? Object.keys(S.items).length : 0;
-    var v = await ask({
-      title: 'Restore this backup?', danger: mine > 0, okText: 'Restore',
-      html: '<p>The backup has <b>' + n + '</b> items. ' + (mine ? 'It will <b>replace</b> the ' + mine + ' items now on this phone.' : '') + '</p>'
-    });
-    if (!v) return;
-    S = obj;
-    S.log.push({ t: Date.now(), type: 'restore', code: '', by: 'Owner', info: n + ' items' });
-    await save();
-    toast('Backup restored. Unlock with the owner PIN from that backup.');
-    setRole('sales');
+      '<div class="card"><h2>Sales people</h2><p class="muted small">Each sales person signs in on the shop phone with the email and password you set here. They can scan, sell and see today\'s sales. They cannot open tagging, counts, reports or settings.</p>' +
+      (ids.length ? ids.map(function (id) {
+        return '<div class="line"><div class="grow"><b>' + esc(staff[id].name) + '</b><small>' + esc(staff[id].email) + '</small></div>' +
+          '<button class="btn small" data-act="staff-remove" data-uid="' + esc(id) + '">Remove</button></div>';
+      }).join('') : '<p class="muted">None yet.</p>') +
+      '<button class="btn primary" data-act="staff-add">Add a sales person</button></div>' +
+      '<div class="card"><h2>Account</h2><p class="muted small">Signed in as owner (' + esc(me.email) + ')</p>' +
+      '<button class="btn" data-act="go" data-to="log">Activity log</button>' +
+      '<button class="btn" data-act="sign-out">Sign out</button></div>';
   }
 
   /* ---------- actions ---------- */
+  function guard(fn) { try { return fn(); } catch (e) { if (e.user) { toast(e.message, 'bad'); return undefined; } throw e; } }
+
   var actions = {
     go: function (el) { go(el.dataset.to); },
-    item: function (el) { if (role === 'owner') go('item', el.dataset.code); },
-    lock: function () { setRole('sales'); },
-    unlock: unlock,
+    item: function (el) {
+      if (role !== 'owner') return;
+      ensureItem(el.dataset.code).then(function () { go('item', el.dataset.code); });
+    },
+    'sign-mode': function () { ui.signMode = ui.signMode === 'create' ? 'in' : 'create'; render(); },
+    'sign-out': function () { stopScan(); return auth.signOut(); },
+    disconnect: function () { try { localStorage.removeItem('shop-pos-firebase'); } catch (e) { /* ignore */ } location.reload(); },
+    'clear-failed': function () { sync.failed = 0; render(); },
     'scan-toggle': function () { if (Scanner.running()) { stopScan(); render(); } else startScan(); },
     'scan-stop': function () { stopScan(); render(); },
     torch: function () { Scanner.toggleTorch(); },
@@ -677,11 +826,20 @@
     'labels-last': function () { ui.labelCodes = ui.lastTagged.slice(); go('labels'); },
     'labels-unprinted': function () { ui.labelCodes = null; go('labels'); },
     'print-labels': printLabels,
-    'labels-done': async function () {
-      labelCodes().forEach(function (c) { S.items[c].printed = true; });
-      await save(); ui.labelCodes = null; ui.lastTagged = []; toast('Marked as printed.'); go('tag');
+    'labels-done': function () {
+      var ops = labelCodes().map(function (c) {
+        S.items[c].printed = true; shadow[c] = JSON.stringify(S.items[c]);
+        return ['update', db.collection('items').doc(c), { printed: true }];
+      });
+      commitOps(ops);
+      ui.labelCodes = null; ui.lastTagged = []; toast('Marked as printed.'); go('tag');
     },
-    'stock-status': function (el) { ui.stock.status = el.dataset.status; ui.stock.limit = 60; render(); },
+    'stock-status': function (el) {
+      ui.stock.status = el.dataset.status; ui.stock.limit = 60; render();
+      if (ui.stock.status === 'sold') {
+        fetchItems(db.collection('items').orderBy('soldAt', 'desc').limit(200)).then(scheduleRender).catch(function (e) { toast(friendly(e), 'bad'); });
+      }
+    },
     'stock-more': function () { ui.stock.limit += 100; $('#stock-list').innerHTML = stockListHtml(); },
     'item-label': function () { ui.labelCodes = [routeArg]; go('labels'); },
     'item-edit': async function () {
@@ -694,33 +852,33 @@
           { name: 'tag', label: 'Tag price', value: String(it.tag || 0), inputmode: 'decimal' }]
       });
       if (!v) return;
-      try { C.editItem(S, it.code, v, who(), Date.now()); } catch (e) { if (e.user) return toast(e.message, 'bad'); throw e; }
-      await save(); render(); toast('Saved.');
+      if (guard(function () { return mutate(function () { return C.editItem(S, it.code, v, who(), Date.now()); }); }) === undefined) return;
+      loadHistory(it.code); render(); toast('Saved.');
     },
     'item-out': async function (el) {
-      var status = el.dataset.status;
+      var status = el.dataset.status, code = routeArg;
       var v = await ask({ title: status === 'missing' ? 'Mark as missing?' : 'Write this item off?', okText: 'Confirm', danger: true,
         fields: [{ name: 'note', label: 'Note (what happened)', required: status === 'writeoff' }] });
       if (!v) return;
-      try { C.takeOut(S, routeArg, status, v.note, who(), Date.now()); } catch (e) { if (e.user) return toast(e.message, 'bad'); throw e; }
-      await save(); render();
+      guard(function () { mutate(function () { C.takeOut(S, code, status, v.note, who(), Date.now()); }); });
+      loadHistory(code); render();
     },
     'item-return': async function () {
-      var it = S.items[routeArg];
+      var it = S.items[routeArg], code = routeArg;
       var v = await ask({ title: it.status === 'sold' ? 'Cancel this sale?' : 'Return to stock?', okText: 'Return to stock',
         html: it.status === 'sold' ? '<p class="muted">The sale of ' + fmt(it.soldPrice) + ' is removed from your sales and stays in the activity log as cancelled.</p>' : '',
         fields: [{ name: 'reason', label: 'Reason', required: true }] });
       if (!v) return;
-      try { C.returnToStock(S, routeArg, v.reason, who(), Date.now()); } catch (e) { if (e.user) return toast(e.message, 'bad'); throw e; }
-      await save(); render();
+      guard(function () { mutate(function () { C.returnToStock(S, code, v.reason, who(), Date.now()); }); });
+      loadHistory(code); render();
     },
     'item-delete': async function () {
+      var code = routeArg;
       var v = await ask({ title: 'Delete this item?', okText: 'Delete', danger: true,
         html: '<p class="muted">Use this only for an item tagged by mistake. The deletion stays in the activity log.</p>',
         fields: [{ name: 'reason', label: 'Reason', required: true }] });
       if (!v) return;
-      try { C.deleteItem(S, routeArg, v.reason, who(), Date.now()); } catch (e) { if (e.user) return toast(e.message, 'bad'); throw e; }
-      await save(); go('stock');
+      if (guard(function () { mutate(function () { C.deleteItem(S, code, v.reason, who(), Date.now()); }); return true; })) go('stock');
     },
     'count-view': function (el) { ui.countView = el.dataset.view; if (ui.countView === 'review') stopScan(); render(); window.scrollTo(0, 0); },
     'count-remaining': function () { ui.showRemaining = !ui.showRemaining; render(); },
@@ -728,133 +886,177 @@
       var r = C.countReview(S);
       var v = await ask({ title: 'Finish the stock count?', okText: 'Finish', danger: r.missing.length > 0,
         html: '<p>' + r.counted + ' of ' + r.expected + ' items were found.' + (r.missing.length ? ' <b>' + r.missing.length + '</b> will be marked missing (' + fmt(r.missingCost) + ').' : '') + '</p>' });
-      if (!v) return;
-      C.finishCount(S, who(), Date.now());
-      await save(); ui.countView = 'scan'; ui.showRemaining = false; render(); toast('Stock count saved.');
+      if (!v || !S.count) return;
+      var summary = null;
+      mutate(function () { summary = C.finishCount(S, who(), Date.now()); });
+      commitOps([['set', db.collection('counts').doc(), clone(summary)], ['delete', countRef()]]);
+      ui.countView = 'scan'; ui.showRemaining = false; render(); toast('Stock count saved.');
     },
     'count-cancel': async function () {
       var v = await ask({ title: 'Throw this count away?', okText: 'Throw away', danger: true, html: '<p class="muted">Nothing will be marked missing.</p>' });
       if (!v) return;
-      C.cancelCount(S, who(), Date.now()); await save(); ui.countView = 'scan'; render();
+      mutate(function () { C.cancelCount(S, who(), Date.now()); }, [['delete', countRef()]]);
+      ui.countView = 'scan'; render();
     },
     'rep-range': function (el) {
       ui.rep.range = el.dataset.range;
       if (ui.rep.range === 'custom' && !ui.rep.from) { ui.rep.from = ui.rep.to = C.isoDay(Date.now()); }
-      render();
+      loadReport(); render();
     },
     'share-summary': async function () {
       var text = summaryText();
       try { if (navigator.share) { await navigator.share({ text: text }); return; } } catch (e) { if (e && e.name === 'AbortError') return; }
       window.open('https://wa.me/?text=' + encodeURIComponent(text), '_blank', 'noopener');
     },
-    'export-csv': function () { download('shop-stock-' + C.isoDay(Date.now()) + '.csv', '﻿' + C.toCSV(S), 'text/csv'); },
-    backup: backup,
-    'restore-pick': function () {
-      var input = $('#restore-file') || document.body.appendChild(Object.assign(document.createElement('input'), { type: 'file', id: 'restore-file', accept: 'application/json,.json', hidden: true }));
-      input.onchange = function () { if (input.files[0]) restoreFrom(input.files[0]); input.value = ''; };
-      input.click();
+    'export-csv': async function () {
+      toast('Preparing the file…');
+      var snap = await db.collection('items').get(), items = {};
+      snap.docs.forEach(function (d) { items[d.id] = d.data(); });
+      download('shop-stock-' + C.isoDay(Date.now()) + '.csv', '﻿' + C.toCSV({ items: items }), 'text/csv');
     },
-    'change-pin': async function () {
-      var v = await ask({ title: 'Change owner PIN', okText: 'Change',
-        fields: [{ name: 'old', label: 'Current PIN', type: 'password', inputmode: 'numeric', required: true },
-          { name: 'pin', label: 'New PIN (4 to 8 digits)', type: 'password', inputmode: 'numeric', required: true }] });
+    'staff-add': async function () {
+      var v = await ask({ title: 'Add a sales person', okText: 'Create login',
+        html: '<p class="muted small">Needs internet. The email is only used as a login name; it does not have to receive mail.</p>',
+        fields: [{ name: 'name', label: 'Name', required: true }, { name: 'email', label: 'Email (login name)', type: 'email', required: true },
+          { name: 'pw', label: 'Password (at least 6 characters)', required: true }] });
       if (!v) return;
-      if (await hash(v.old) !== S.pinHash) return toast('Current PIN is wrong.', 'bad');
-      if (!/^\d{4,8}$/.test(v.pin)) return toast('The PIN must be 4 to 8 digits.', 'bad');
-      S.pinHash = await hash(v.pin); await save(); toast('PIN changed.');
+      if (v.pw.length < 6) return toast('The password must be at least 6 characters.', 'bad');
+      try {
+        // A second connection creates the login, so the owner stays signed in on this phone.
+        var app2 = fb.apps.filter(function (a) { return a.name === 'staff-admin'; })[0] || fb.initializeApp(cfg, 'staff-admin');
+        var cred = await app2.auth().createUserWithEmailAndPassword(v.email, v.pw);
+        var uid = cred.user.uid;
+        await app2.auth().signOut();
+        await shopRef().update(path('staff', uid), { name: v.name, email: v.email });
+        toast(v.name + ' can now sign in on the shop phone.');
+      } catch (e) { toast(friendly(e), 'bad'); }
+    },
+    'staff-remove': async function (el) {
+      var uid = el.dataset.uid, s = (shop.staff || {})[uid];
+      var v = await ask({ title: 'Remove ' + (s ? s.name : 'this person') + '?', okText: 'Remove', danger: true, html: '<p class="muted">They will no longer be able to open the shop records.</p>' });
+      if (!v) return;
+      try { await shopRef().update(path('staff', uid), FV().delete()); } catch (e) { toast(friendly(e), 'bad'); }
     }
   };
 
   var forms = {
-    setup: async function (v) {
-      if (!/^\d{4,8}$/.test(v.pin)) return toast('The PIN must be 4 to 8 digits.', 'bad');
-      if (v.pin !== v.pin2) return toast('The two PINs are not the same.', 'bad');
-      var rec = String(Math.floor(10000000 + Math.random() * 90000000));
-      if (window.crypto && crypto.getRandomValues) { var a = new Uint32Array(1); crypto.getRandomValues(a); rec = String(10000000 + (a[0] % 90000000)); }
-      S.shop.name = v.name; S.pinHash = await hash(v.pin); S.recoveryHash = await hash('rec:' + rec);
-      await save();
-      if (navigator.storage && navigator.storage.persist) { try { navigator.storage.persist(); } catch (e) { /* optional */ } }
-      role = 'owner'; try { sessionStorage.setItem('shop-pos-role', 'owner'); } catch (e) { /* ignore */ }
-      route = 'tag'; render();
-      await ask({ title: 'Write down your recovery code', okText: 'I have written it down', noCancel: true,
-        html: '<p class="bigsum">' + rec.slice(0, 4) + ' ' + rec.slice(4) + '</p><p class="muted">If you forget the PIN, this code is the only way to set a new one. It is shown once. Keep it at home, not in the shop.</p>' });
+    connect: function (v) {
+      var c = parseConfig(v.config);
+      if (!c) return toast('That does not look like the Firebase settings block. It must contain apiKey, projectId and appId.', 'bad');
+      try { localStorage.setItem('shop-pos-firebase', JSON.stringify(c)); } catch (e) { return toast('This browser will not store the settings (private mode?).', 'bad'); }
+      location.reload();
     },
-    'add-code': function (v, form) { if (v.code) addToBasket(v.code); var i = $('#view [data-form=add-code] input'); if (i) i.focus(); },
-    'count-code': function (v) { if (v.code) countScan(v.code); var i = $('#view [data-form=count-code] input'); if (i) i.focus(); },
+    signin: async function (v) {
+      try {
+        if (ui.signMode === 'create') {
+          if (v.pw !== v.pw2) return toast('The two passwords are not the same.', 'bad');
+          await auth.createUserWithEmailAndPassword(v.email, v.pw);
+        } else await auth.signInWithEmailAndPassword(v.email, v.pw);
+        ui.signMode = 'in';
+      } catch (e) { toast(friendly(e), 'bad'); }
+    },
+    'create-shop': async function (v) {
+      var base = C.newState();
+      try {
+        await shopRef().set({ name: v.name, currency: 'KES', ownerUid: me.uid, ownerEmail: me.email, staff: {}, categories: base.categories,
+          sizes: base.sizes, label: base.label, seq: base.seq, createdAt: Date.now() });
+      } catch (e) { toast((e.code || '').indexOf('permission-denied') >= 0 ? 'This shop already has an owner. Ask the owner to add you as a sales person.' : friendly(e), 'bad'); }
+    },
+    'add-code': function (v) { if (v.code) addToBasket(v.code); var i = $('#view [data-form=add-code] input'); if (i) i.value = ''; },
+    'count-code': function (v) { if (v.code) countScan(v.code); var i = $('#view [data-form=count-code] input'); if (i) i.value = ''; },
     tag: async function (v) {
-      var codes;
-      try { codes = C.addItems(S, v, who(), Date.now()); } catch (e) { if (e.user) return toast(e.message, 'bad'); throw e; }
-      await save();
-      ui.lastTagged = codes;
+      if (ui.busy) return;
+      // Check the form first, so numbers are not used up by a mistake.
+      if (guard(function () { C.addItems(C.newState(), v, '', 0); return true; }) === undefined) return;
+      if (!sync.online) return toast('Tagging needs internet, so two phones never give out the same number.', 'bad');
+      var qty = Math.floor(Number(v.qty) || 1), seq;
+      ui.busy = true;
+      try {
+        seq = await db.runTransaction(function (tx) {
+          return tx.get(shopRef()).then(function (d) { var s = d.data().seq || 1000; tx.update(shopRef(), { seq: s + qty }); return s; });
+        });
+      } catch (e) { ui.busy = false; return toast('Could not reserve tag numbers: ' + friendly(e), 'bad'); }
+      ui.busy = false;
+      S.seq = seq;
+      ui.lastTagged = mutate(function () { return C.addItems(S, v, who(), Date.now()); });
       ui.tagForm = { cat: v.cat, gender: v.gender, size: v.size, desc: '', buy: '', tag: '', qty: '1' };
       render(); window.scrollTo(0, 0);
     },
-    'count-start': async function (v) {
-      try { C.startCount(S, v.scope, who(), Date.now()); } catch (e) { if (e.user) return toast(e.message, 'bad'); throw e; }
-      await save(); ui.countView = 'scan'; render();
+    'count-start': function (v) {
+      if (guard(function () { mutate(function () { C.startCount(S, v.scope, who(), Date.now()); }); return true; }) === undefined) return;
+      commitOps([['set', countRef(), clone(S.count)]]);
+      ui.countView = 'scan'; render();
     },
     settings: async function (v) {
       var lines = function (t) { var seen = {}; return t.split('\n').map(function (s) { return s.trim(); }).filter(function (s) { if (!s || seen[s]) return false; seen[s] = 1; return true; }); };
-      var cats = lines(v.categories), staff = lines(v.staff);
+      var cats = lines(v.categories);
       if (!cats.length) return toast('Keep at least one category.', 'bad');
-      if (!staff.length) return toast('Keep at least one sales person.', 'bad');
-      S.shop.name = v.name; S.categories = cats; S.sizes = lines(v.sizes); S.staff = staff;
-      await save(); render(); toast('Settings saved.');
+      shopRef().update({ name: v.name, categories: cats, sizes: lines(v.sizes) }).catch(function (e) { toast(friendly(e), 'bad'); });
+      toast('Settings saved.');
     }
   };
 
   document.addEventListener('click', function (e) {
     var el = e.target.closest('[data-act]');
-    if (!el || !S) return;
+    if (!el) return;
     var fn = actions[el.dataset.act];
-    if (fn) Promise.resolve(fn(el, e)).catch(function (err) { console.error(err); toast('Something went wrong: ' + err.message, 'bad'); });
+    if (fn) Promise.resolve().then(function () { return fn(el, e); }).catch(function (err) { console.error(err); toast('Something went wrong: ' + friendly(err), 'bad'); });
   });
   document.addEventListener('submit', function (e) {
     var form = e.target.closest('[data-form]');
     if (!form) return;
     e.preventDefault();
     var v = {}; new FormData(form).forEach(function (val, k) { v[k] = String(val).trim(); });
-    Promise.resolve(forms[form.dataset.form](v, form)).catch(function (err) { console.error(err); toast('Something went wrong: ' + err.message, 'bad'); });
+    Promise.resolve().then(function () { return forms[form.dataset.form](v, form); }).catch(function (err) { console.error(err); toast('Something went wrong: ' + friendly(err), 'bad'); });
   });
   document.addEventListener('input', function (e) {
     var el = e.target, k = el.dataset && el.dataset.input;
     if (k === 'price') { ui.basket[+el.dataset.i].price = el.value.replace(/,/g, '').trim(); $('#basket-total').textContent = fmt(basketTotal()); }
-    else if (k === 'stock-q') { ui.stock.q = el.value; ui.stock.limit = 60; $('#stock-list').innerHTML = stockListHtml(); }
+    else if (k === 'stock-q') {
+      ui.stock.q = el.value; ui.stock.limit = 60; $('#stock-list').innerHTML = stockListHtml();
+      var code = C.normCode(el.value);
+      if (C.validCode(code) && !S.items[code]) ensureItem(code).then(function () { if (ui.stock.q === el.value && $('#stock-list')) $('#stock-list').innerHTML = stockListHtml(); });
+    }
   });
   document.addEventListener('change', function (e) {
     var el = e.target, k = el.dataset && el.dataset.change;
     if (!k) return;
-    if (k === 'seller') { ui.seller = el.value; try { localStorage.setItem('shop-pos-seller', el.value); } catch (err) { /* ignore */ } }
-    else if (k === 'stock-cat') { ui.stock.cat = el.value; ui.stock.limit = 60; render(); }
-    else if (k === 'label-size') { S.label.size = el.value; save(); render(); }
-    else if (k === 'label-price') { S.label.price = el.checked; save(); render(); }
-    else if (k === 'label-cut') { S.label.cut = el.checked; save(); render(); }
-    else if (k === 'rep-from') { ui.rep.from = el.value; render(); }
-    else if (k === 'rep-to') { ui.rep.to = el.value; render(); }
+    if (k === 'stock-cat') { ui.stock.cat = el.value; ui.stock.limit = 60; render(); }
+    else if (k === 'label-size') { S.label.size = el.value; saveLabelPrefs(); render(); }
+    else if (k === 'label-price') { S.label.price = el.checked; saveLabelPrefs(); render(); }
+    else if (k === 'label-cut') { S.label.cut = el.checked; saveLabelPrefs(); render(); }
+    else if (k === 'rep-from') { ui.rep.from = el.value; loadReport(); render(); }
+    else if (k === 'rep-to') { ui.rep.to = el.value; loadReport(); render(); }
   });
-  // If the phone is put down for a while in owner mode, go back to sales mode.
+  document.addEventListener('focusout', function () { if (renderDeferred) setTimeout(function () { if (renderDeferred) softRender(); }, 150); });
   document.addEventListener('visibilitychange', function () {
-    if (document.hidden) { hiddenAt = Date.now(); stopScan(); }
-    else {
-      if (S && S.pinHash && role === 'owner' && hiddenAt && Date.now() - hiddenAt > 10 * 60000) { role = 'sales'; route = 'sell'; try { sessionStorage.setItem('shop-pos-role', 'sales'); } catch (e) { /* ignore */ } }
-      if (S) render();
-    }
+    if (document.hidden) { stopScan(); return; }
+    // A new day started while the phone was asleep: follow today's sales, not yesterday's.
+    if (screen === 'app' && dataStarted && startOfDay(Date.now()) !== dayStart && listeners.restartToday) listeners.restartToday();
+    if (screen === 'app') scheduleRender();
   });
+  window.addEventListener('online', function () { sync.online = true; scheduleRender(); });
+  window.addEventListener('offline', function () { sync.online = false; scheduleRender(); });
 
-  async function boot() {
-    await Store.open();
-    S = (await Store.load()) || C.newState();
-    try {
-      ui.seller = localStorage.getItem('shop-pos-seller') || '';
-      if (S.pinHash && sessionStorage.getItem('shop-pos-role') === 'owner') role = 'owner';
-    } catch (e) { /* ignore */ }
-    if (S.staff.indexOf(ui.seller) < 0) ui.seller = '';
-    route = 'sell';
-    render();
+  function boot() {
     if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
       navigator.serviceWorker.register('sw.js').catch(function () { /* offline use is optional */ });
     }
+    cfg = window.SHOP_FIREBASE_CONFIG || null; cfgFromFile = !!cfg;
+    if (!cfg) { try { cfg = JSON.parse(localStorage.getItem('shop-pos-firebase')); } catch (e) { cfg = null; } }
+    if (!cfg || !window.firebase) { screen = 'connect'; render(); return; }
+    try {
+      fb = window.firebase; fb.initializeApp(cfg);
+      auth = fb.auth(); db = fb.firestore();
+      // Keep a copy on the phone so the app opens and sells without internet.
+      db.enablePersistence({ synchronizeTabs: true }).catch(function (e) { console.warn('offline copy not available', e && e.code); });
+    } catch (e) {
+      console.error(e); screen = 'connect'; render();
+      toast('Those Firebase settings did not work: ' + friendly(e), 'bad');
+      return;
+    }
+    render();
+    auth.onAuthStateChanged(onAuth);
   }
-  window.__shop = { state: function () { return S; } };
   boot();
 })();

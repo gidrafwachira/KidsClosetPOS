@@ -24,6 +24,7 @@ svg{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.9;stroke
 #top .shop b{font-size:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #top .shop span{font-size:12.5px;font-weight:800;color:var(--blue-deep)}
 body.owner #top .shop span{color:var(--pink)}
+#top .shop span.warn{color:var(--warn)}
 #top-actions{display:flex;gap:6px;align-items:center}
 .icon-btn{border:0;background:none;color:var(--ink);padding:9px;border-radius:12px;display:flex}
 
@@ -98,6 +99,8 @@ dl{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;margin:12px 0 0}
 dt{color:var(--muted);font-size:14px} dd{margin:0;font-weight:700;overflow-wrap:anywhere}
 .banner{display:flex;gap:10px;align-items:center;justify-content:space-between;background:var(--warn-soft);color:var(--warn);border-radius:12px;padding:10px 12px;margin:0 0 12px;font-weight:700;font-size:14px}
 .banner .btn{flex:none}
+.banner.bad{background:var(--bad-soft);color:var(--bad)}
+.btn[disabled]{opacity:.5}
 
 /* camera */
 #scanbox{position:sticky;top:57px;z-index:4;background:#0B0D1A;border-radius:var(--radius);overflow:hidden;margin:0 0 12px;height:min(46vh,340px)}

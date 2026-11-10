@@ -20,18 +20,14 @@
     return {
       v: 1,
       shop: { name: 'Kidsclosetbydee', currency: 'KES' },
-      pinHash: '', recoveryHash: '',
       seq: 1000,          // last tag sequence number used
-      saleSeq: 0,         // last sale number used
       categories: DEFAULT_CATEGORIES.slice(),
       sizes: DEFAULT_SIZES.slice(),
-      staff: ['Sales person'],
       label: { size: 'a4-24', price: true, cut: true },
       items: {},          // code -> item
       log: [],            // every change, oldest first
       count: null,        // stock count in progress
-      counts: [],         // finished stock counts
-      lastBackup: 0
+      counts: []          // finished stock counts
     };
   }
 
@@ -129,11 +125,10 @@
       if (!(p > 0)) fail('Enter the selling price for tag ' + l.code + '.');
       total += p;
     });
-    state.saleSeq += 1;
-    var saleId = state.saleSeq, pay = opts.pay || 'Cash', by = opts.by || '';
+    var saleId = opts.saleId || String(now), pay = opts.pay || 'Cash', by = opts.by || '';
     lines.forEach(function (l) {
       var it = state.items[l.code], p = money(l.price);
-      it.status = 'sold'; it.soldAt = now; it.soldPrice = p; it.soldBy = by; it.pay = pay; it.saleId = saleId;
+      it.status = 'sold'; it.soldAt = now; it.soldPrice = p; it.soldBy = by; it.soldByUid = opts.uid || ''; it.pay = pay; it.saleId = saleId;
       addLog(state, 'sold', l.code, by, 'Sale #' + saleId + ' · ' + p + ' · ' + pay, now);
     });
     return { saleId: saleId, total: money(total), count: lines.length };
@@ -147,7 +142,7 @@
     if (it.status === 'sold') {
       addLog(state, 'void', code, by, 'Sale #' + it.saleId + ' of ' + it.soldPrice + ' (' + it.pay + ', by ' +
         (it.soldBy || '?') + ') cancelled. ' + (reason || ''), now);
-      delete it.soldAt; delete it.soldPrice; delete it.soldBy; delete it.pay; delete it.saleId;
+      delete it.soldAt; delete it.soldPrice; delete it.soldBy; delete it.soldByUid; delete it.pay; delete it.saleId;
     } else {
       addLog(state, 'found', code, by, 'Was ' + statusLabel(it.status) + '. ' + (reason || ''), now);
       delete it.outAt; delete it.note;
@@ -290,21 +285,12 @@
     return [head.join(',')].concat(rows).join('\r\n');
   }
 
-  // Accept a backup file only if it looks like this app's data.
-  function checkBackup(obj) {
-    if (!obj || typeof obj !== 'object' || obj.v !== 1 || typeof obj.items !== 'object' || !Array.isArray(obj.log) ||
-      typeof obj.seq !== 'number') fail('This file is not a backup from this app.');
-    var base = newState();
-    Object.keys(base).forEach(function (k) { if (obj[k] === undefined) obj[k] = base[k]; });
-    return obj;
-  }
-
   root.Core = {
     DAY: DAY, PAYMENTS: PAYMENTS, newState: newState, checkDigit: checkDigit, makeCode: makeCode, normCode: normCode,
     validCode: validCode, money: money, describe: describe, addItems: addItems, editItem: editItem, deleteItem: deleteItem,
     sell: sell, returnToStock: returnToStock, takeOut: takeOut, statusLabel: statusLabel, startCount: startCount,
     countScan: countScan, countReview: countReview, finishCount: finishCount, cancelCount: cancelCount, report: report,
-    stock: stock, toCSV: toCSV, isoDay: isoDay, checkBackup: checkBackup
+    stock: stock, toCSV: toCSV, isoDay: isoDay
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = root.Core;
 })(typeof window !== 'undefined' ? window : globalThis);

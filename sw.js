@@ -1,7 +1,8 @@
 /* Keeps a copy of the app on the phone so it opens and works without internet. */
-var CACHE = 'shop-pos-v1';
+var CACHE = 'shop-pos-v2';
 var FILES = ['./', 'index.html', 'style.css', 'manifest.webmanifest', 'js/core.js', 'js/scanner.js', 'js/app.js',
-  'vendor/qrcode.js', 'vendor/jsQR.js', 'icons/logo.jpg', 'icons/icon-192.png', 'icons/icon-512.png'];
+  'vendor/qrcode.js', 'vendor/jsQR.js', 'vendor/firebase-app-compat.js', 'vendor/firebase-auth-compat.js',
+  'vendor/firebase-firestore-compat.js', 'firebase-config.js', 'icons/logo.jpg', 'icons/icon-192.png', 'icons/icon-512.png'];
 
 self.addEventListener('install', function (e) {
   e.waitUntil(caches.open(CACHE).then(function (c) { return c.addAll(FILES); }).then(function () { return self.skipWaiting(); }));
@@ -13,7 +14,9 @@ self.addEventListener('activate', function (e) {
 });
 // Answer from the saved copy straight away, and refresh that copy in the background when online.
 self.addEventListener('fetch', function (e) {
-  if (e.request.method !== 'GET') return;
+  // Only this app's own files and its fonts. Everything else (the online records) goes straight to the network.
+  var url = new URL(e.request.url);
+  if (e.request.method !== 'GET' || (url.origin !== location.origin && !/fonts\.(googleapis|gstatic)\.com$/.test(url.hostname))) return;
   e.respondWith(caches.open(CACHE).then(function (cache) {
     return cache.match(e.request).then(function (hit) {
       var fresh = fetch(e.request).then(function (res) {
