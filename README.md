@@ -36,12 +36,12 @@ The shared records live in Google Firebase, on its free plan. You need a Google 
 
 ### C. Connect the phones
 
-1. **Owner's phone:** open the address in Chrome, paste the `firebaseConfig` block, press **Connect**. Tap **Owner, first time? Create the owner account**, choose your email and a password, then **Create shop**.
+1. **Owner's phone:** open the address in Chrome. Tap **Owner, first time? Create the owner account**, choose your email and a password, then **Create shop**.
 2. Still on the owner's phone: **Settings (gear) > Sales people > Add a sales person**. Give a name, an email to use as the login name, and a password.
-3. **Shop phone:** open the same address, paste the same `firebaseConfig` block, and sign in with the sales person's email and password.
+3. **Shop phone:** open the same address and sign in with the sales person's email and password.
 4. On each phone use the browser menu and choose **Add to Home screen**. Allow the camera when asked.
 
-To skip the pasting step on every phone, put the `firebaseConfig` block into [`firebase-config.js`](firebase-config.js) in this repository. Those values identify the project and are not passwords.
+The shop's Firebase settings are already in [`firebase-config.js`](firebase-config.js), so the phones connect on their own. Those values identify the project and are not passwords.
 
 ## Daily use
 

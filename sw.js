@@ -1,5 +1,5 @@
 /* Keeps a copy of the app on the phone so it opens and works without internet. */
-var CACHE = 'shop-pos-v2';
+var CACHE = 'shop-pos-v3';
 var FILES = ['./', 'index.html', 'style.css', 'manifest.webmanifest', 'js/core.js', 'js/scanner.js', 'js/app.js',
   'vendor/qrcode.js', 'vendor/jsQR.js', 'vendor/firebase-app-compat.js', 'vendor/firebase-auth-compat.js',
   'vendor/firebase-firestore-compat.js', 'firebase-config.js', 'icons/logo.jpg', 'icons/icon-192.png', 'icons/icon-512.png'];
